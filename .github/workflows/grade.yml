@@ -1,0 +1,302 @@
+name: Grade Submission
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'src/solution.py'
+
+jobs:
+  grade:
+    runs-on: [self-hosted, grader]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+
+    env:
+      # Active task configuration (updated weekly)
+      ACTIVE_TASK_CONFIG: /srv/opsChallenge/tasks/active_task.json
+      GRADER_DIR: /srv/opsChallenge/grader
+      CONDA_PYTHON_EXEC: /home/runner/miniconda3/envs/ops/bin/python
+      LOG_BASE_DIR: /srv/logs
+      LEADERBOARD_BASE_DIR: /srv/opsChallenge/leaderboard
+
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+        env:
+          GIT_CONFIG_COUNT: 3
+          GIT_CONFIG_KEY_0: http.version
+          GIT_CONFIG_VALUE_0: HTTP/1.1
+          GIT_CONFIG_KEY_1: http.postBuffer
+          GIT_CONFIG_VALUE_1: 524288000
+          GIT_CONFIG_KEY_2: protocol.version
+          GIT_CONFIG_VALUE_2: 1
+
+      - name: Load active task and init environment
+        id: init
+        run: |
+          # Load active task configuration
+          TASK_JSON=$(${CONDA_PYTHON_EXEC} -c "import json; config=json.load(open('${ACTIVE_TASK_CONFIG}')); print(config['active_task_path'])")
+          TASK_ID=$(${CONDA_PYTHON_EXEC} -c "import json; config=json.load(open('${ACTIVE_TASK_CONFIG}')); print(config['active_task_id'])")
+
+          echo "TASK_JSON=${TASK_JSON}" >> $GITHUB_ENV
+          echo "TASK_ID=${TASK_ID}" >> $GITHUB_ENV
+
+          # Extract user info
+          USERNAME="${{ github.event.pull_request.user.login }}"
+          USER_ID="${{ github.event.pull_request.user.id }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          RUN_ID="${{ github.run_id }}"
+          RUN_ATTEMPT="${{ github.run_attempt }}"
+
+          echo "USERNAME=${USERNAME}" >> $GITHUB_ENV
+          echo "USER_ID=${USER_ID}" >> $GITHUB_ENV
+          echo "PR_NUMBER=${PR_NUMBER}" >> $GITHUB_ENV
+          echo "RUN_ID=${RUN_ID}" >> $GITHUB_ENV
+          echo "RUN_ATTEMPT=${RUN_ATTEMPT}" >> $GITHUB_ENV
+
+          # Create user-specific log directory
+          ${CONDA_PYTHON_EXEC} - <<PY
+          import json
+          import sys
+          sys.path.insert(0, '${GRADER_DIR}')
+          from log_manager import LogManager
+
+          manager = LogManager('${LOG_BASE_DIR}')
+          log_files = manager.create_log_files(
+              task_id='${TASK_ID}',
+              username='${USERNAME}',
+              pr_number=${PR_NUMBER},
+              run_id='${RUN_ID}',
+              run_attempt=${RUN_ATTEMPT}
+          )
+
+          # Write metadata
+          metadata = {
+              'Time': '$(date -Is)',
+              'Task ID': '${TASK_ID}',
+              'Task JSON': '${TASK_JSON}',
+              'Username': '${USERNAME}',
+              'User ID': '${USER_ID}',
+              'PR Number': ${PR_NUMBER},
+              'Run ID': '${RUN_ID}',
+              'Run Attempt': ${RUN_ATTEMPT},
+              'Workspace': '${GITHUB_WORKSPACE}',
+              'Python': '${CONDA_PYTHON_EXEC}',
+              'Runner': '${{ runner.name }}',
+              'Repo': '${{ github.repository }}'
+          }
+          manager.write_metadata(log_files['log_file'], metadata)
+
+          # Export log paths
+          print(f"LOG_DIR={log_files['log_dir']}")
+          print(f"LOG_PREFIX={log_files['log_prefix']}")
+          print(f"LOG_FILE={log_files['log_file']}")
+          PY
+
+          # Capture output and set env vars
+          eval $(${CONDA_PYTHON_EXEC} - <<PY
+          import sys
+          sys.path.insert(0, '${GRADER_DIR}')
+          from log_manager import LogManager
+
+          manager = LogManager('${LOG_BASE_DIR}')
+          log_files = manager.create_log_files(
+              task_id='${TASK_ID}',
+              username='${USERNAME}',
+              pr_number=${PR_NUMBER},
+              run_id='${RUN_ID}',
+              run_attempt=${RUN_ATTEMPT}
+          )
+
+          for key, value in log_files.items():
+              if key != 'log_dir':
+                  print(f"echo '{key.upper()}={value}' >> \$GITHUB_ENV")
+          PY
+          )
+
+      - name: Run Grader
+        id: run_grader
+        run: |
+          set +e
+
+          # Run grader with timeout
+          RESULT_JSON=$(taskset -c 0-19 ${CONDA_PYTHON_EXEC} ${GRADER_DIR}/host_verify_mem.py "${{ github.workspace }}" "${TASK_JSON}")
+          EXIT_CODE=$?
+
+          # Save result to temporary file for workflow steps
+          echo "${RESULT_JSON}" > result.json
+
+          # Log grader execution and result to log file
+          {
+            echo ""
+            echo "=" | head -c 80
+            echo ""
+            echo "GRADER EXECUTION"
+            echo "=" | head -c 80
+            echo ""
+            echo "Exit Code: ${EXIT_CODE}"
+            echo "Result JSON:"
+            echo "${RESULT_JSON}"
+            echo ""
+          } >> "${LOG_FILE}"
+
+          # Write formatted result summary to log
+          ${CONDA_PYTHON_EXEC} - <<PY
+          import json, sys
+          sys.path.insert(0, '${GRADER_DIR}')
+          from log_manager import LogManager
+          from pathlib import Path
+
+          try:
+              with open('result.json') as f:
+                  result = json.load(f)
+
+              log_mgr = LogManager('${LOG_BASE_DIR}')
+              log_mgr.write_result_summary(Path('${LOG_FILE}'), result)
+          except Exception as e:
+              print(f"Warning: Failed to write result summary: {e}", file=sys.stderr)
+          PY
+
+          # Set output for next steps
+          echo "result=${RESULT_JSON}" >> $GITHUB_OUTPUT
+
+          # Don't fail the workflow
+          exit 0
+
+      - name: Update Leaderboard and Generate Summary
+        id: summary
+        if: always()
+        run: |
+          ${CONDA_PYTHON_EXEC} - <<'PY'
+          import json, os, sys
+          sys.path.insert(0, os.environ['GRADER_DIR'])
+          from leaderboard_manager import LeaderboardManager
+          from log_manager import LogManager
+
+          # Read grader output
+          try:
+              with open('result.json','r') as f:
+                  result = json.load(f)
+          except Exception:
+              result = {"status":"GRADER_ERROR", "error": "Failed to read result"}
+
+          status = result.get("status", "UNKNOWN")
+          elapsed = result.get("elapsed_seconds", 0)
+          max_diff = result.get("max_diff")
+          error = result.get("error")
+          task_id = os.environ.get('TASK_ID', 'unknown')
+          username = os.environ['USERNAME']
+          user_id = os.environ['USER_ID']
+          pr_number = int(os.environ['PR_NUMBER'])
+
+          # Update leaderboard
+          leaderboard_mgr = LeaderboardManager(os.environ['LEADERBOARD_BASE_DIR'])
+          leaderboard_result = leaderboard_mgr.record_submission(
+              task_id=task_id,
+              username=username,
+              user_id=user_id,
+              pr_number=pr_number,
+              status=status,
+              elapsed_seconds=elapsed,
+              max_diff=max_diff,
+              error=error
+          )
+
+          user_stats = leaderboard_result['user_stats']
+
+          # Update global log
+          log_mgr = LogManager(os.environ['LOG_BASE_DIR'])
+          log_mgr.append_to_global_log(task_id, username, pr_number, status)
+
+          # Generate summary lines
+          status_emoji = {
+              'PASS': '✅',
+              'WRONG_ANSWER': '❌',
+              'TIMEOUT': '⏱️',
+              'RUNTIME_ERROR': '💥',
+              'VERIFY_ERROR': '⚠️',
+              'GRADER_ERROR': '🔧'
+          }.get(status, '❓')
+
+          lines = [
+              f"## {status_emoji} Grader Result",
+              f"**Status:** `{status}`",
+              f"**User:** @{username}",
+              f"**Task:** {task_id}"
+          ]
+
+          pr_lines = [
+              f"## {status_emoji} Grader Result",
+              "",
+              f"**Status:** `{status}`",
+              f"**Task:** {task_id}",
+              ""
+          ]
+
+          if elapsed > 0:
+              lines.append(f"**Elapsed Time:** {elapsed:.3f} seconds")
+              pr_lines.append(f"**Elapsed Time:** {elapsed:.3f} seconds")
+
+          if max_diff is not None:
+              if max_diff == 0:
+                  diff_str = "0 (Perfect match! ✨)"
+              elif max_diff < 1e-6:
+                  diff_str = f"{max_diff:.2e} (Very close)"
+              else:
+                  diff_str = f"{max_diff:.6f}"
+              lines.append(f"**Max Difference:** {diff_str}")
+              pr_lines.append(f"**Max Difference:** {diff_str}")
+
+          if error:
+              lines.append(f"**Error:** {error}")
+              pr_lines.append(f"**Error:** `{error}`")
+
+          # Add user statistics
+          lines.append("")
+          lines.append("### 📊 Your Statistics")
+          lines.append(f"- Total Submissions: {user_stats['total_submissions']}")
+          lines.append(f"- Passed: {user_stats['passed_submissions']}")
+          lines.append(f"- Failed: {user_stats['failed_submissions']}")
+
+          pr_lines.append("")
+          pr_lines.append("### 📊 Your Statistics")
+          pr_lines.append(f"- **Total Submissions:** {user_stats['total_submissions']}")
+          pr_lines.append(f"- **Passed:** {user_stats['passed_submissions']}")
+          pr_lines.append(f"- **Failed:** {user_stats['failed_submissions']}")
+
+          if user_stats.get('best_time'):
+              lines.append(f"- Best Time: {user_stats['best_time']:.3f}s")
+              pr_lines.append(f"- **Best Time:** {user_stats['best_time']:.3f}s")
+
+          # Write Job Summary
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'w') as f:
+              f.write("\n".join(lines))
+
+          # Write PR comment
+          with open('pr_comment.txt','w') as f:
+              f.write("\n".join(pr_lines) + "\n")
+
+          # Log to log file
+          with open(os.environ['LOG_FILE'], 'a') as f:
+              f.write("\n" + "=" * 80 + "\n")
+              f.write("SUMMARY\n")
+              f.write("=" * 80 + "\n")
+              f.write("\n".join(lines))
+              f.write("\n")
+          PY
+          
+      - name: Upload grader result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grader-result
+          path: |
+            result.json
+            pr_comment.txt
+          if-no-files-found: warn
+          retention-days: 7
