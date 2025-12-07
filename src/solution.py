@@ -15,6 +15,7 @@ class ops:
             expr_y = col_y_or_expr
 
         cov_xy = pl.rolling_cov(expr_x, expr_y, window_size=window, ddof=1, min_samples=2) # ddof=1
+        
         var_x = expr_x.rolling_var(window_size=window, ddof=1, min_samples=2)
 
         # Must use the same var_x threshold
