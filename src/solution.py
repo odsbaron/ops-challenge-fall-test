@@ -32,7 +32,7 @@ class ops:
         return beta.alias("rolling_regbeta")
 
 
-# 完全保持你原来的函数签名和返回值（np.ndarray）
+
 def ops_rolling_regbeta(input_path: str, window: int = 20) -> np.ndarray:
     # 必须先按 symbol + 时间排序，否则 rolling 结果错乱
     df = (
