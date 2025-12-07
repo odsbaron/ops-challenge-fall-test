@@ -1,6 +1,7 @@
 import polars as pl
 import numpy as np
 
+
 class ops:
     @staticmethod
     def rolling_regbeta(col_x_or_expr, col_y_or_expr, window: int) -> pl.Expr:
@@ -32,5 +33,5 @@ def ops_rolling_regbeta(input_path: str, window: int = 20) -> np.ndarray:
         .select(
             ops.rolling_regbeta("Low", "Close", window).over("symbol")
         )
-    ).collect()
+    ).collect(engine="ray")
     return res.to_numpy()
