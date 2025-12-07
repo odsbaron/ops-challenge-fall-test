@@ -33,5 +33,5 @@ def ops_rolling_regbeta(input_path: str, window: int = 20) -> np.ndarray:
         .select(
             ops.rolling_regbeta("Low", "Close", window).over("symbol")
         )
-    ).collect(engine="ray")
+    ).collect()
     return res.to_numpy()
